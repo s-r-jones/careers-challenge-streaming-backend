@@ -1,12 +1,16 @@
-# Convenience targets. Python 3.10+ stdlib only, no pip dependencies.
+# Convenience targets. The eval targets need only Python 3.10+; run, test and
+# load use uv, which installs the service's dependencies on first run.
 
 PYTHON ?= python3
 SERVICE_URL ?= http://localhost:8080
 
-.PHONY: help example smoke baseline burst offline adversarial
+.PHONY: help run test load example smoke baseline burst offline adversarial
 
 help:
 	@echo "Targets:"
+	@echo "  run            run our service on :8080 (uvicorn + uvloop)"
+	@echo "  test           run unit tests"
+	@echo "  load           load test, e.g. make load ARGS=\"--rate 50000 --duration 30\""
 	@echo "  example        run the example stub service on :8080 (replace with yours)"
 	@echo "  smoke          30s baseline run against \$$SERVICE_URL + scorecard"
 	@echo "  baseline       60s baseline"
@@ -20,6 +24,16 @@ DEVICES ?= 50
 
 example:
 	$(PYTHON) example_solution/service.py
+
+test:
+	uv run pytest -q
+
+run:
+	uv sync -q
+	exec .venv/bin/python -m service.main  # exec: a kill of make reaches the service
+
+load:
+	uv run python -m loadgen.load $(ARGS)
 
 smoke:
 	$(PYTHON) eval/check.py smoke --target $(SERVICE_URL) --devices $(DEVICES)

@@ -1,150 +1,47 @@
 # Teton Challenge, Real-time Streaming Backend
 
-> **No prior experience required. The solution is the signal.**
-> Every submission gets feedback within 7 days. → `info@teton.ai`
+## Stack and storage
 
----
+**Compute:** Plain async Python on uvicorn and uvloop. With five routes I skipped the web framework. One worker fell behind at 50k/s, so four share the port.
 
-A Teton sensor sits in a care room. It streams events, heartbeats, presence, motion, sleep state, fall warnings, network status, to our backend, all day, every day. We have a few thousand of those right now. We will have a few hundred thousand. Each event matters; some matter more than others; all of them have to land in the right place quickly.
+**Storage:** One append-only JSONL file, a format I've used at Meow Wolf. Every worker appends to it and reads new lines every 5ms. The OS appends each line in one piece, so writers never collide. The state we serve covers the last hour and fits in memory. A database would buy durable acks and alarm history beyond an hour. Neither is needed yet, and a database would load from the log.
 
-This challenge is about building the part of our backend that **takes in those events, makes sense of them in real time, and stays correct under pressure**.
+**Transport:** JSON over HTTP for ingest. Parsing is under a tenth of the cost per event, so protobuf would save little. SSE for the alarm feed, so clients can resume with `Last-Event-ID`.
 
-## The problem
+## Ordering and late events
 
-Build a service that ingests events from **5,000 simulated devices**, each streaming multiple event types at variable rates, and produces correct real-time aggregations.
+Health and occupancy keep state sorted by `ts`, so a late event fixes history on the next read. We reject events more than an hour from our clock.
 
-You will receive events that look like:
+- **Health:** Each device keeps a sorted list of seconds with a heartbeat in the last 5 minutes. The last heartbeat only changes for a newer `ts`.
+- **Occupancy:** Each room keeps its presence changes sorted by `ts`, inserted with a binary search. For a window we add up the milliseconds the room was occupied.
+- **Alarms:** A dict keyed on device id and `ts` drops repeated falls. The feed stays in arrival order. Clients resume from a `Last-Event-ID` bookmark, and a bookmark only works on a list that grows at the end.
 
-```json
-{ "device_id": "dev_0001", "room_id": "room_14", "type": "heartbeat",   "ts": "2026-05-23T18:53:49.123Z" }
-{ "device_id": "dev_0001", "room_id": "room_14", "type": "presence",    "ts": "...", "in_room": true }
-{ "device_id": "dev_0001", "room_id": "room_14", "type": "motion",      "ts": "...", "magnitude": 0.81 }
-{ "device_id": "dev_0001", "room_id": "room_14", "type": "sleep_state", "ts": "...", "state": "asleep" }
-{ "device_id": "dev_0001", "room_id": "room_14", "type": "fall_warn",   "ts": "...", "confidence": 0.92 }
-{ "device_id": "dev_0001", "room_id": "room_14", "type": "net_status",  "ts": "...", "rssi": -68 }
-```
+## Backpressure
 
-You receive them via your choice of transport, HTTP/gRPC/WebSocket/MQTT, from the event generator we provide. Your job:
+A POST only parses the event, appends it to the log and returns 202. State catches up within a few ms. Above about 59k/s requests wait but aren't dropped. No 202 means not logged, so the client retries. I didn't prioritize `fall_warn` over heartbeats: a 10x burst from 5,000 devices is 50k/s, so nothing waits.
 
-### Required outputs, queryable in real time
+## Restart correctness
 
-1. **Per-device health.** For every device, the latest heartbeat and a rolling availability over the last 5 minutes (heartbeats expected at ~1Hz).
-2. **Per-room occupancy.** For every room, current `in_room` boolean (latest presence event wins) and the percentage of time the room was occupied over the last 1 minute, 5 minutes, and 1 hour.
-3. **Fall warnings, deduplicated.** A device sometimes sends the same fall warning multiple times within a few seconds (sensor jitter). Emit each distinct fall event exactly once, and persist them with their original timestamp.
-4. **Active alarms feed.** A real-time feed (long-poll, SSE, WebSocket, your choice) that consumers can subscribe to and receive new fall warnings as they happen, in order per room, within 1 second of ingestion.
+The log is written before the 202, so a kill loses nothing we acknowledged. Every minute one worker snapshots state and its log position. Startup loads the snapshot and replays only the log after it, so a 4M-event log restarts in 0.3s instead of 8s. We don't fsync, so a power cut could lose the last moments. SSE clients reconnect with `Last-Event-ID` and get every alarm they missed. A browser's `EventSource` does this for free.
 
-### The complications you must handle
-
-This is where the challenge is.
-
-- **Per-device ordering.** Events from the same device arrive in order most of the time, but not always, devices buffer when offline and replay when reconnecting. Order by `ts`, not by arrival.
-- **Clock skew.** Devices have wall clocks that drift. Trust `ts` for ordering and aggregation, but reject events more than 1 hour in the future (clearly broken) and accept events up to 1 hour in the past (offline buffer).
-- **Late events.** A device may go offline for 20 minutes and replay every event when it reconnects. Your aggregations must update correctly when historical events arrive.
-- **Backpressure.** When ingest spikes 10x for 30 seconds, you must not lose events. You may *delay* them. You may *prioritize* `fall_warn` over `heartbeat`. You must not drop them silently.
-- **Restart correctness.** Kill the service; bring it back up. State for per-device health, per-room occupancy, and recent alarms must be recoverable. You decide how (persistent log, periodic snapshot, fresh from replay, whatever, but it must work).
-
-## What "good" looks like
-
-Not "passes the tests once". Good means:
-
-- **At 10x burst rate** (50,000 events/sec sustained for 30s), the alarm feed still emits within 1s of ingest p95.
-- **After a hard restart**, every consumer that was subscribed reconnects and resumes without missing alarms generated during the gap.
-- **Late events from an offline device** correctly fix up the per-room occupancy history (i.e., if room was actually occupied during that gap, the 1h window reflects it after replay).
-- **Adding a 5,001st device** doesn't require redeploying anything.
-
-## What we evaluate
-
-We run a grader that:
-
-- Launches the event generator at baseline rate (5k devices × ~1 event/sec mixed) for 5 minutes.
-- Spikes to 10x for 30 seconds, twice.
-- Simulates 20% of devices going offline for 60 seconds and replaying their buffered events on reconnect.
-- Hard-kills your service after 3 minutes and brings it back.
-- At regular intervals queries: per-device health, per-room occupancy windows, dedup counts on fall warnings, and the live alarm feed.
-- Checks for correctness against ground truth (we know exactly what the generator emitted).
-
-## Scoring (out of 100)
-
-| Category | Points |
-|---|---|
-| Correctness of aggregations under all conditions | 30 |
-| Behavior under burst load and backpressure | 20 |
-| Restart / recovery correctness | 15 |
-| Alarm feed latency p95 | 15 |
-| Code quality and design clarity | 15 |
-| Observability (logs, metrics) | 5 |
-
-**Pass bar:** 75. Below it we won't say yes, but we always reply.
-
-## What's in this repo
-
-```
-.
-├── README.md          - this file
-├── SUBMISSION.md      - fill in with your submission
-├── Makefile           - convenience targets (see `make help`)
-├── event_generator/   - simulates N devices in baseline / burst / offline / adversarial modes
-├── eval/              - scenario runner + scorecard
-├── example_solution/  - a deliberately-bad stub service so you can see
-│                        the read endpoints we expect. Replace with yours.
-└── docs/
-    └── event_schema.md  the full event spec
-```
-
-## Quickstart
-
-Python 3.10+. No pip dependencies.
+## How to run it locally
 
 ```bash
-# Terminal 1: start the example stub service (replace with your own later)
-make example
-
-# Terminal 2: run the smoke scenario
-make smoke
+# needs uv: https://docs.astral.sh/uv/
+rm -rf data                      # start empty
+make run                         # 4 workers on :8080
+make adversarial DEVICES=5000    # in a second terminal; or smoke, baseline, burst, offline
 ```
 
-The smoke run takes ~30 seconds. The example stub stores everything in memory with no dedup, no late-event handling, no restart correctness — it will score badly on the scorecard. That's the point. Beat it.
+## Reported metrics
 
-Bigger scenarios: `make baseline`, `make burst`, `make offline`, `make adversarial`. Crank devices with `DEVICES=500 make burst`. Point eval at your own service with `make smoke SERVICE_URL=http://localhost:9090`.
+Measured on an M1 Max laptop with our load tester in `loadgen/`.
 
-The eval expects these read endpoints on your service:
+- Sustained ingest rate: 50k events/s for 90s with 0 failed. About 59k/s flat out.
+- Alarm feed latency p50 / p95: 5ms / 13ms at 50k/s.
+- Behavior under hard kill + restart: back in 0.3s after kill -9, with no acknowledged event lost. SSE clients resume and miss no alarms. POSTs sent during those 0.3s get no 202 and need a retry.
+- Aggregation correctness on replayed events: all five provided scenarios at 5,000 devices return one alarm per distinct fall. After a kill -9, every room and device on all four workers matches a brute-force recount of the log (`eval/recount.py`).
 
-```
-GET /devices/{device_id}/health
-GET /rooms/{room_id}/occupancy?window=1m|5m|1h
-GET /alarms?since=<ts>
-```
+## With another week
 
-The shape that `example_solution/service.py` returns is what the scorer reads. If your endpoints look different, the scorer will warn.
-
-## What we are **not** looking for
-
-- Kafka-just-because. Use it if it earns its place. Justify it briefly.
-- Hand-rolled distributed consensus.
-- A pretty dashboard. Your service exposes HTTP/gRPC endpoints; that's enough.
-- Long architectural prose. Show the thinking, not the slideware.
-
-## What to send us
-
-Email **info@teton.ai** with subject **`Solution: Real-time streaming backend`** and:
-
-1. Link to your fork (public) or a tarball.
-2. Writeup (under 400 words):
-   - Stack and storage choice, why.
-   - How you handle late events and ordering.
-   - How you handle backpressure.
-   - One thing you would change if you had another week.
-3. How to run your service against `event_generator/` locally.
-4. Your **CV** (attached), plus **LinkedIn** and **GitHub** links so we can put the work in context.
-
-**We reply with feedback within 7 days, every submission, no exceptions.** If your work hits the bar, the next step is a conversation with engineers.
-
-## Notes
-
-- Time: strong candidates spend 10–25 hours on this. Spend more if you want.
-- Stack: any language, any database, any message broker. We will run it locally, say so if you need Docker Compose, Nix, or just `make run`.
-- LLMs: use them as you would on any other day. We don't care how you got there. We care that you can explain every choice.
-
-Good luck.
-
-The Teton engineering team
+At hundreds of thousands of devices I'd give each region its own deployment, so patient data stays in the country. Within a region I'd partition by facility, since alarms are watched per facility. Kafka partitioned by facility would replace the shared file, with a database behind it for alarm history.
